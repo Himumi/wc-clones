@@ -476,4 +476,26 @@ mod tests {
         let got = String::from_utf8(buffer).expect("Could not get string from buffer");
         assert_eq!(got, want);
     }
+
+    #[test]
+    fn test_count_word() {
+        let input = "console.log('Hello World');
+
+function greet(name?: string) {
+    if (name === undefined) {
+        name = 'World';
+    }
+    console.log(`Hello, ${name}`);
+}
+
+greet('John');
+greet();
+";
+        let mut buffer = String::with_capacity(1024);
+        let count = count_word(input.as_bytes(), &mut buffer).expect("Could not count the file");
+
+        assert_eq!(count.line, 11);
+        assert_eq!(count.word, 20);
+        assert_eq!(count.byte, 183);
+    }
 }
