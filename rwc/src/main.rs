@@ -1,9 +1,8 @@
 use std::env;
-use std::error::Error;
 use std::fmt;
-use std::fs::File;
+use std::fs;
 use std::io;
-use std::io::{BufRead, BufReader, IsTerminal, Read, stdin};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write, stdin};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -23,7 +22,10 @@ fn main() {
         counts.push(io::Result::Ok(total_count(&counts)));
     }
 
-    print_out(&counts, &command);
+    let stdout = io::stdout();
+    let mut lock = stdout.lock();
+
+    print_out(&mut lock, &counts, &command);
 }
 
 #[derive(Default)]
@@ -50,7 +52,33 @@ impl fmt::Display for ParseError {
     }
 }
 
-impl Error for ParseError {}
+impl std::error::Error for ParseError {}
+
+#[derive(Debug)]
+enum AppError {
+    EmptyFilePath,
+}
+
+impl fmt::Display for AppError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AppError::EmptyFilePath => {
+                write!(f, "Empty File Path")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AppError {}
+
+impl From<AppError> for io::Error {
+    fn from(err: AppError) -> Self {
+        let kind = match err {
+            AppError::EmptyFilePath => io::ErrorKind::Other,
+        };
+        io::Error::new(kind, err)
+    }
+}
 
 fn parse(args: &[String]) -> Result<Command, ParseError> {
     let mut command = Command::default();
@@ -74,7 +102,7 @@ fn parse(args: &[String]) -> Result<Command, ParseError> {
     Ok(command)
 }
 
-#[derive(Default)]
+#[derive(Default, Debug, Clone)]
 struct Count {
     line: usize,
     word: usize,
@@ -119,7 +147,7 @@ fn total_count(counts: &[io::Result<Count>]) -> Count {
     total
 }
 
-fn read_file(paths: &[String]) -> Vec<io::Result<Count>> {
+fn read_file<T: AsRef<str>>(paths: &[T]) -> Vec<io::Result<Count>> {
     let mut buffer = String::with_capacity(4096);
 
     let mut result: Vec<io::Result<Count>> =
@@ -129,11 +157,12 @@ fn read_file(paths: &[String]) -> Vec<io::Result<Count>> {
         result.push(count_word(stdin(), &mut buffer));
     } else {
         if paths.len().eq(&0) {
-            result.push(Err(io::Error::other(String::from("Empty File Path"))));
+            result.push(Err(io::Error::from(AppError::EmptyFilePath)));
         }
 
         for path in paths.iter() {
-            match File::open(path) {
+            let path_ref = path.as_ref();
+            match fs::File::open(path_ref) {
                 Ok(value) => result.push(count_word(value, &mut buffer)),
                 Err(err) => result.push(Err(err)),
             };
@@ -143,33 +172,33 @@ fn read_file(paths: &[String]) -> Vec<io::Result<Count>> {
     result
 }
 
-fn print_out(results: &[io::Result<Count>], command: &Command) {
+fn print_out(writer: &mut impl Write, results: &[io::Result<Count>], command: &Command) {
     let digit_max = max_digit(results);
 
     for (i, result_union) in results.iter().enumerate() {
         match result_union {
-            Err(err) => println!(" {}", err),
+            Err(err) => writeln!(writer, " {}", err).unwrap(),
             Ok(count) => {
                 if command.is_line {
-                    print!("{:1$}", count.line, digit_max);
+                    write!(writer, "{:1$}", count.line, digit_max).unwrap();
                 }
                 if command.is_word {
-                    print!("{:1$}", count.word, digit_max + 1);
+                    write!(writer, "{:1$}", count.word, digit_max + 1).unwrap();
                 }
                 if command.is_byte {
-                    print!("{:1$}", count.byte, digit_max + 1);
+                    write!(writer, "{:1$}", count.byte, digit_max + 1).unwrap();
                 }
 
                 // No Flags
                 if !command.is_line && !command.is_word && !command.is_byte {
-                    print!("{:1$}", count.line, digit_max);
-                    print!("{:1$}", count.word, digit_max + 1);
-                    print!("{:1$}", count.byte, digit_max + 1);
+                    write!(writer, "{:1$}", count.line, digit_max).unwrap();
+                    write!(writer, "{:1$}", count.word, digit_max + 1).unwrap();
+                    write!(writer, "{:1$}", count.byte, digit_max + 1).unwrap();
                 }
 
                 match command.paths.get(i) {
-                    Some(value) => println!(" {}", value),
-                    None => println!(),
+                    Some(value) => writeln!(writer, " {}", value).unwrap(),
+                    None => writeln!(writer).unwrap(),
                 }
             }
         }
@@ -210,6 +239,9 @@ Options:
 
 #[cfg(test)]
 mod tests {
+    use core::panic;
+    use std::io::Write;
+
     use super::*;
 
     #[test]
@@ -356,5 +388,92 @@ mod tests {
             assert_eq!(got.is_word, case.want.is_word);
             assert_eq!(got.is_byte, case.want.is_byte);
         }
+    }
+
+    #[test]
+    fn test_fail_read_file() {
+        let mut got = read_file::<&str>(&[]);
+        assert_eq!(got.len(), 1);
+
+        if let Some(first) = got.pop() {
+            let io_err = first.unwrap_err();
+            if let Some(inner_err) = io_err.into_inner() {
+                match inner_err.downcast::<AppError>() {
+                    Ok(my_err) => {
+                        assert!(matches!(*my_err, AppError::EmptyFilePath));
+                    }
+                    Err(_) => {
+                        panic!("The inner error was not an AppError type");
+                    }
+                }
+            }
+        } else {
+            panic!("Could not get the first item");
+        }
+    }
+
+    #[test]
+    fn test_succeed_read_file() {
+        let file_name = "./test.ts";
+        {
+            let mut file = fs::File::create(file_name).expect("Could not to create the file");
+            file.write_all(b"console.log('Hello, world');\n")
+                .expect("Could not to write data to the file");
+            file.flush().expect("Could not to flush the data");
+        }
+
+        let mut got = read_file(&[file_name, "notFound.file"]);
+        assert_eq!(got.len(), 2);
+
+        let second = got.pop().unwrap();
+        assert!(second.is_err());
+
+        let first = got.pop().unwrap();
+        match first {
+            Ok(item) => {
+                assert_eq!(item.line, 1);
+                assert_eq!(item.word, 2);
+                assert_eq!(item.byte, 29);
+            }
+            Err(err) => {
+                panic!("the second item is an error: {}", err);
+            }
+        }
+
+        fs::remove_file(file_name).expect("Could not delete the file");
+    }
+
+    #[test]
+    fn test_print_out() {
+        let mut buffer = Vec::new();
+        let command = Command {
+            paths: ["test.ts", "try.ts", "notFound.file"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            is_help: false,
+            is_line: false,
+            is_word: false,
+            is_byte: false,
+        };
+
+        let resutls: [io::Result<Count>; 3] = [
+            Ok(Count {
+                line: 1,
+                word: 12,
+                byte: 123,
+            }),
+            Ok(Count {
+                line: 1,
+                word: 12,
+                byte: 123,
+            }),
+            Err(io::Error::from(AppError::EmptyFilePath)),
+        ];
+        print_out(&mut buffer, &resutls, &command);
+
+        let want = "  1  12 123 test.ts\n  1  12 123 try.ts\n Empty File Path\n";
+        let got = String::from_utf8(buffer).expect("Could not get string from buffer");
+        assert_eq!(got, want);
     }
 }
