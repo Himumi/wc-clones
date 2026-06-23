@@ -19,68 +19,69 @@ func main() {
 		return
 	}
 
-	if command.Flags.IsHelp {
+	if command.IsHelp {
 		fmt.Println("HELP")
 		return
 	}
 
-	countLen := len(command.Paths)
-	if countLen == 0 {
-		countLen = 1
-	}
-	counts := make([]Count, 0, countLen)
-
-	if !term.IsTerminal(int(os.Stdin.Fd())) && len(command.Paths) == 0 {
-		c, err := CountWord(os.Stdin, "")
-		if err != nil {
-			c.Error = err
-		}
-		counts = append(counts, c)
-	} else {
-		if len(command.Paths) == 0 {
-			fmt.Fprintln(os.Stderr, "file: empty file path")
-			return
-		}
-
-		for _, path := range command.Paths {
-			var c Count
-
-			if f, err := os.Open(path); err != nil {
-				c.Error = err
-			} else {
-				if c, err = CountWord(f, path); err != nil {
-					c.Error = err
-				}
-
-				if err := f.Close(); err != nil {
-					fmt.Fprintln(os.Stderr, err)
-					return
-				}
-			}
-			counts = append(counts, c)
-		}
-	}
-
+	counts := Read(command.Paths)
 	if len(counts) > 1 {
-		total := Total(counts)
-		counts = append(counts, total)
+		counts = append(counts, Total(counts))
+		command.Paths = append(command.Paths, "total")
 	}
 
-	message, err := Print(counts, command)
-	if err != nil {
+	if err := PrintOut(os.Stdout, counts, command); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
 	}
+}
 
-	fmt.Print(message)
+func Read(paths []string) []Count {
+	countLen := len(paths)
+	if countLen == 0 {
+		countLen = 1
+	}
+
+	counts := make([]Count, 0, countLen)
+	reader := bufio.NewReader(nil)
+
+	if !term.IsTerminal(int(os.Stdin.Fd())) && len(paths) == 0 {
+		reader.Reset(os.Stdin)
+
+		c, err := CountWord(reader)
+		if err != nil {
+			c.Error = err
+		}
+
+		counts = append(counts, c)
+	} else {
+		if len(paths) == 0 {
+			err := Count{Error: errors.New("empty file path")}
+			counts = append(counts, err)
+		} else {
+			for _, path := range paths {
+				var c Count
+
+				if f, err := os.Open(path); err != nil {
+					c.Error = err
+				} else {
+					reader.Reset(f)
+					defer f.Close()
+
+					if c, err = CountWord(reader); err != nil {
+						c.Error = err
+					}
+				}
+				counts = append(counts, c)
+			}
+		}
+	}
+
+	return counts
 }
 
 type Command struct {
-	Paths []string
-	Flags Flags
-}
-
-type Flags struct {
+	Paths  []string
 	IsHelp bool
 	IsLine bool
 	IsWord bool
@@ -95,14 +96,14 @@ func Parse(args []string) (Command, error) {
 	for _, arg := range args[1:] {
 		if !strings.HasPrefix(arg, "-") {
 			c.Paths = append(c.Paths, arg)
-		} else if strings.EqualFold(arg, "--help") {
-			c.Flags.IsHelp = true
-		} else if strings.EqualFold(arg, "-l") || strings.EqualFold(arg, "--line") {
-			c.Flags.IsLine = true
-		} else if strings.EqualFold(arg, "-w") || strings.EqualFold(arg, "--word") {
-			c.Flags.IsWord = true
-		} else if strings.EqualFold(arg, "-c") || strings.EqualFold(arg, "--byte") {
-			c.Flags.IsByte = true
+		} else if arg == "--help" {
+			c.IsHelp = true
+		} else if arg == "-l" || arg == "--line" {
+			c.IsLine = true
+		} else if arg == "w" || arg == "--word" {
+			c.IsWord = true
+		} else if arg == "-c" || arg == "--byte" {
+			c.IsByte = true
 		} else {
 			return c, errors.New("parse: unknown flag")
 		}
@@ -112,53 +113,14 @@ func Parse(args []string) (Command, error) {
 }
 
 type Count struct {
-	Path  string
 	Error error
 	Line  int
 	Word  int
 	Byte  int
 }
 
-func (c *Count) Len(command Command, max int) int {
-	const (
-		space     = 1
-		lineBreak = 1
-	)
-
-	var total int
-	if c.Error != nil {
-		total += space + len(c.Error.Error()) + lineBreak
-		return total
-	}
-
-	if command.Flags.IsLine {
-		total += max
-	}
-
-	if command.Flags.IsWord {
-		total += space + max
-	}
-
-	if command.Flags.IsByte {
-		total += space + max
-	}
-
-	if !command.Flags.IsLine &&
-		!command.Flags.IsWord &&
-		!command.Flags.IsByte {
-		total += max*3 + space*2
-	}
-	total += space + len(c.Path) + lineBreak
-
-	return total
-}
-
-func CountWord(f *os.File, path string) (Count, error) {
-	c := Count{
-		Path: path,
-	}
-	reader := bufio.NewReaderSize(f, 1024)
-
+func CountWord(reader *bufio.Reader) (Count, error) {
+	c := Count{}
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -195,7 +157,7 @@ func word(line string) int {
 }
 
 func Total(counts []Count) Count {
-	total := Count{Path: "total"}
+	total := Count{}
 
 	for _, count := range counts {
 		if count.Error == nil {
@@ -209,95 +171,60 @@ func Total(counts []Count) Count {
 	return total
 }
 
-const fmtString = " %s\n"
-
-func Print(counts []Count, command Command) (string, error) {
+func PrintOut(base io.Writer, counts []Count, command Command) error {
+	w := bufio.NewWriter(base)
 	max := maxDigit(counts)
-	length := lenCounts(counts, command, max)
 
-	var s strings.Builder
-	s.Grow(length)
-
-	for _, c := range counts {
+	for i, c := range counts {
 		if c.Error != nil {
-			if _, err := fmt.Fprintf(&s, fmtString, c.Error); err != nil {
-				return "", err
+			if _, err := fmt.Fprintf(w, "%s\n", c.Error); err != nil {
+				return err
 			}
 		} else {
-			countStr, err := print(c, command, max)
-			if err != nil {
-				return "", err
+			if command.IsLine {
+				if _, err := fmt.Fprintf(w, "%*d", max, c.Line); err != nil {
+					return err
+				}
+			}
+			if command.IsWord {
+				if _, err := fmt.Fprintf(w, "%*d", max+1, c.Word); err != nil {
+					return err
+				}
+			}
+			if command.IsByte {
+				if _, err := fmt.Fprintf(w, "%*d", max+1, c.Byte); err != nil {
+					return err
+				}
 			}
 
-			if _, err := s.WriteString(countStr); err != nil {
-				return "", err
+			if !command.IsLine && !command.IsWord && !command.IsByte {
+				if _, err := fmt.Fprintf(w, "%*d", max, c.Line); err != nil {
+					return err
+				}
+				if _, err := fmt.Fprintf(w, "%*d", max+1, c.Word); err != nil {
+					return err
+				}
+				if _, err := fmt.Fprintf(w, "%*d", max+1, c.Byte); err != nil {
+					return err
+				}
+			}
+
+			path := ""
+			if i < len(command.Paths) {
+				path = command.Paths[i]
+			}
+
+			if _, err := fmt.Fprintf(w, " %s\n", path); err != nil {
+				return err
 			}
 		}
 	}
 
-	return s.String(), nil
-}
-
-func print(count Count, command Command, max int) (string, error) {
-	length := count.Len(command, max)
-
-	line := fmt.Sprintf(genNumFmt(count.Line, max), count.Line)
-	word := fmt.Sprintf(genNumFmt(count.Word, max+1), count.Word)
-	byte := fmt.Sprintf(genNumFmt(count.Byte, max+1), count.Byte)
-
-	var s strings.Builder
-	s.Grow(length)
-
-	if command.Flags.IsLine {
-		if _, err := s.WriteString(line); err != nil {
-			return "", err
-		}
+	if err := w.Flush(); err != nil {
+		return err
 	}
 
-	if command.Flags.IsWord {
-		if _, err := s.WriteString(word); err != nil {
-			return "", err
-		}
-	}
-
-	if command.Flags.IsByte {
-		if _, err := s.WriteString(byte); err != nil {
-			return "", err
-		}
-	}
-
-	if !command.Flags.IsLine && !command.Flags.IsWord && !command.Flags.IsByte {
-		if _, err := s.WriteString(line); err != nil {
-			return "", err
-		}
-		if _, err := s.WriteString(word); err != nil {
-			return "", err
-		}
-		if _, err := s.WriteString(byte); err != nil {
-			return "", err
-		}
-	}
-
-	if _, err := fmt.Fprintf(&s, fmtString, count.Path); err != nil {
-		return "", err
-	}
-
-	return s.String(), nil
-}
-
-func genNumFmt(num int, max int) string {
-	d := int(digit(num))
-	length := max - d + 1
-
-	var s strings.Builder
-	s.Grow(length)
-
-	for range max - d {
-		s.WriteString(" ")
-	}
-	s.WriteString("%d")
-
-	return s.String()
+	return nil
 }
 
 func digit(num int) float64 {
@@ -318,13 +245,4 @@ func maxDigit(counts []Count) int {
 	}
 
 	return int(max)
-}
-
-func lenCounts(cs []Count, c Command, max int) int {
-	var total int
-	for _, count := range cs {
-		total += count.Len(c, max)
-	}
-
-	return total
 }
