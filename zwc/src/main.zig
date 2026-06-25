@@ -27,7 +27,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Start App
     const z_args = try init.minimal.args.toSlice(arena);
-    var o_command = parse(arena, z_args) catch |err|
+    const o_command = parse(z_args[1..]) catch |err|
         return std.debug.print(S_ERROR_FORMAT, .{err});
 
     if (o_command.is_help)
@@ -36,65 +36,88 @@ pub fn main(init: std.process.Init) !void {
             try stdout.flush();
         };
 
-    var o_results = try read(arena, io, o_command.z_paths.items);
+    var o_path_iter: Path = .init(z_args[1..]);
+    var o_results = try read(arena, io, &o_path_iter);
 
     if (o_results.items.len > 1) {
-        try o_command.z_paths.append(arena, try arena.dupe(u8, "total"));
         try o_results.append(arena, countTotal(o_results.items));
     }
 
-    try printOut(stdout, o_results.items, o_command);
+    try printOut(stdout, o_results.items, o_command, &o_path_iter);
 }
 
+const Path = struct {
+    z_args: []const []const u8,
+    n_current: usize,
+
+    pub fn init(source: []const []const u8) Path {
+        return .{ .z_args = source, .n_current = 0 };
+    }
+
+    fn isValid(_: Path, path: []const u8) bool {
+        return !startsWith(u8, path, "-");
+    }
+
+    pub fn len(self: *Path) usize {
+        var count: usize = 0;
+        while (self.next()) |_| {
+            count += 1;
+        }
+        self.n_current = 0;
+        return count;
+    }
+
+    pub fn next(self: *Path) ?[]const u8 {
+        if (self.n_current >= self.z_args.len) {
+            return null;
+        }
+
+        var path = self.z_args[self.n_current];
+        if (self.isValid(path)) {
+            self.n_current += 1;
+            return path;
+        }
+
+        while (true) {
+            self.n_current += 1;
+
+            if (self.n_current >= self.z_args.len) {
+                return null;
+            }
+
+            path = self.z_args[self.n_current];
+            if (self.isValid(path)) {
+                self.n_current += 1;
+                return path;
+            }
+        }
+    }
+
+    pub fn reset(self: *Path) void {
+        self.n_current = 0;
+    }
+};
+
 const Command = struct {
-    z_paths: ArrayList([]const u8),
     is_help: bool,
     is_line: bool,
     is_word: bool,
     is_byte: bool,
 
     pub const empty = Command{
-        .z_paths = .empty,
         .is_help = false,
         .is_line = false,
         .is_word = false,
         .is_byte = false,
     };
-
-    pub fn withCapacity(
-        gpa: Allocator,
-        capacity: usize,
-    ) error{OutOfMemory}!Command {
-        return .{
-            .z_paths = try .initCapacity(gpa, capacity),
-            .is_help = false,
-            .is_line = false,
-            .is_word = false,
-            .is_byte = false,
-        };
-    }
-
-    pub fn deinit(self: *Command, gpa: Allocator) void {
-        for (self.z_paths.items) |s_path| {
-            gpa.free(s_path);
-        }
-        self.z_paths.deinit(gpa);
-    }
 };
 
-fn parse(
-    gpa: Allocator,
-    z_args: []const []const u8,
-) (ParserError || Allocator.Error)!Command {
-    var o_command: Command = try .withCapacity(gpa, countPaths(z_args[1..]));
-    errdefer o_command.deinit(gpa);
+fn parse(z_args: []const []const u8) ParserError!Command {
+    var o_command: Command = .empty;
 
-    for (z_args[1..]) |s_arg| {
+    for (z_args) |s_arg| {
         if (!startsWith(u8, s_arg, "-")) {
-            const s_path = try gpa.dupe(u8, s_arg);
-            errdefer gpa.free(s_path);
-
-            try o_command.z_paths.append(gpa, s_path);
+            continue;
         } else if (eql(u8, s_arg, "--help")) {
             o_command.is_help = true;
         } else if (eql(u8, s_arg, "-l") or eql(u8, s_arg, "--line")) {
@@ -112,83 +135,51 @@ fn parse(
 }
 
 test "parse" {
-    const gpa = std.testing.allocator;
     const Case = struct {
         a_args: []const []const u8,
-        o_want: CommandCase,
+        o_want: Command,
+    };
 
-        const CommandCase = struct {
-            z_paths: []const []const u8,
-            is_help: bool,
-            is_line: bool,
-            is_word: bool,
-            is_byte: bool,
-        };
+    const normal_command: Command = .{
+        .is_help = false,
+        .is_line = true,
+        .is_word = true,
+        .is_byte = true,
+    };
+
+    const help_command: Command = .{
+        .is_help = true,
+        .is_line = false,
+        .is_word = false,
+        .is_byte = false,
     };
 
     const a_cases = [_]Case{
         .{
             .a_args = &.{ "zwc", "main.ts" },
-            .o_want = .{
-                .z_paths = &.{"main.ts"},
-                .is_help = false,
-                .is_line = false,
-                .is_word = false,
-                .is_byte = false,
-            },
+            .o_want = .empty,
         },
         .{
             .a_args = &.{ "zwc", "-l", "-w", "-c", "main.ts" },
-            .o_want = .{
-                .z_paths = &.{"main.ts"},
-                .is_help = false,
-                .is_line = true,
-                .is_word = true,
-                .is_byte = true,
-            },
+            .o_want = normal_command,
         },
         .{
             .a_args = &.{ "zwc", "--line", "--word", "--byte", "main.ts" },
-            .o_want = .{
-                .z_paths = &.{"main.ts"},
-                .is_help = false,
-                .is_line = true,
-                .is_word = true,
-                .is_byte = true,
-            },
+            .o_want = normal_command,
         },
         .{
             .a_args = &.{ "zwc", "--help", "main.ts", "--help" },
-            .o_want = .{
-                .z_paths = &.{"main.ts"},
-                .is_help = true,
-                .is_line = false,
-                .is_word = false,
-                .is_byte = false,
-            },
+            .o_want = help_command,
         },
         .{
             .a_args = &.{ "zwc", "main.ts", "try.ts" },
-            .o_want = .{
-                .z_paths = &.{ "main.ts", "try.ts" },
-                .is_help = false,
-                .is_line = false,
-                .is_word = false,
-                .is_byte = false,
-            },
+            .o_want = .empty,
         },
     };
 
     // Succeeded Cases
     for (a_cases) |o_case| {
-        var got = try parse(gpa, o_case.a_args);
-        defer got.deinit(gpa);
-
-        try expectEqual(got.z_paths.items.len, o_case.o_want.z_paths.len);
-
-        for (got.z_paths.items, o_case.o_want.z_paths) |s_path, s_want_path| {
-            try expectEqualSlices(u8, s_want_path, s_path);
-        }
+        const got = try parse(o_case.a_args);
 
         inline for (std.meta.fields(Command)) |field| {
             if (comptime !eql(u8, field.name, "z_paths")) {
@@ -201,7 +192,7 @@ test "parse" {
     }
 
     // An Error Case
-    const e_err = parse(gpa, &.{ "zwc", "-a", "main.ts" });
+    const e_err = parse(&.{ "zwc", "-a", "main.ts" });
     try expectError(ParserError.UnknownFlag, e_err);
 }
 
@@ -231,9 +222,15 @@ test "sizeFilePath" {
 }
 
 const Count = struct {
-    n_line: usize = 0,
-    n_word: usize = 0,
-    n_byte: usize = 0,
+    n_line: usize,
+    n_word: usize,
+    n_byte: usize,
+
+    pub const empty: Count = .{
+        .n_line = 0,
+        .n_word = 0,
+        .n_byte = 0,
+    };
 };
 
 fn countWord(io: Io, z_buffer: []u8, o_file: File) DelimiterError!Count {
@@ -242,7 +239,7 @@ fn countWord(io: Io, z_buffer: []u8, o_file: File) DelimiterError!Count {
 }
 
 fn readCount(o_interface: *Io.Reader) DelimiterError!Count {
-    var o_count: Count = .{};
+    var o_count: Count = .empty;
 
     while (true) {
         const s_line = o_interface.takeDelimiterInclusive('\n') catch |err|
@@ -279,7 +276,7 @@ test "countWord" {
         \\    }
         \\    console.log(`Hello, ${name}`);
         \\  }
-        \\  
+        \\
         \\ greet();
         \\ greet("John");
         \\
@@ -290,7 +287,7 @@ test "countWord" {
     const want: Count = .{
         .n_line = 10,
         .n_word = 20,
-        .n_byte = 191,
+        .n_byte = 189,
     };
 
     inline for (std.meta.fields(Count)) |field| {
@@ -302,7 +299,7 @@ test "countWord" {
 }
 
 fn countTotal(z_results: []anyerror!Count) Count {
-    var o_total: Count = .{};
+    var o_total: Count = .empty;
 
     for (z_results) |e_result| {
         const o_count = e_result catch continue;
@@ -339,24 +336,27 @@ test "countTotal" {
 fn read(
     gpa: Allocator,
     io: Io,
-    z_paths: []const []const u8,
+    o_path: *Path,
 ) (Allocator.Error || Io.Cancelable)!ArrayList(anyerror!Count) {
-    const n_counts = if (z_paths.len > 1) z_paths.len + 1 else 1;
+    const n_paths = o_path.len();
 
-    var o_list: ArrayList(anyerror!Count) = try .initCapacity(gpa, n_counts);
+    var o_list: ArrayList(anyerror!Count) = try .initCapacity(
+        gpa,
+        if (n_paths > 1) n_paths + 1 else 1,
+    );
     errdefer o_list.deinit(gpa);
 
     const z_buffer = try gpa.alloc(u8, 4096);
     defer gpa.free(z_buffer);
 
-    if (!try File.stdin().isTty(io) and z_paths.len == 0) {
+    if (!try File.stdin().isTty(io) and n_paths == 0) {
         try o_list.append(gpa, countWord(io, z_buffer, File.stdin()));
-    } else if (z_paths.len == 0) {
+    } else if (n_paths == 0) {
         try o_list.append(gpa, AppError.EmptyFilePath);
     } else {
         // Read files by iterating paths
         const cwd = Dir.cwd();
-        for (z_paths) |s_path| {
+        while (o_path.next()) |s_path| {
             const o_file = cwd.openFile(io, s_path, .{}) catch |err| {
                 try o_list.append(gpa, err);
                 continue;
@@ -364,6 +364,7 @@ fn read(
             defer o_file.close(io);
             try o_list.append(gpa, countWord(io, z_buffer, o_file));
         }
+        o_path.reset(); // Reset path tracer.
     }
 
     return o_list;
@@ -373,9 +374,9 @@ test "read - empty paths error when stdin is a Tty" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    const paths: []const []const u8 = &.{};
+    var path: Path = .init(&.{});
 
-    var result = try read(gpa, io, paths);
+    var result = try read(gpa, io, &path);
     defer result.deinit(gpa);
 
     try expectEqual(@as(usize, 1), result.items.len);
@@ -390,18 +391,16 @@ test "read - valid file iteration and error handling" {
 
     const test_filename = "test_temp_file.txt";
     const cwd = std.Io.Dir.cwd();
+
     const file = try cwd.createFile(io, test_filename, .{});
     try file.writeStreamingAll(io, "Hello Zig world!\n");
     file.close(io);
 
     defer cwd.deleteFile(io, test_filename) catch {};
 
-    const paths: []const []const u8 = &.{
-        test_filename,
-        "non_existent_file.xyz",
-    };
+    var path: Path = .init(&.{ test_filename, "non_existent_file.xyz" });
 
-    var result = try read(gpa, io, paths);
+    var result = try read(gpa, io, &path);
     defer result.deinit(gpa);
 
     try std.testing.expectEqual(2, result.items.len);
@@ -420,12 +419,14 @@ fn printOut(
     writer: *Io.Writer,
     z_results: []anyerror!Count,
     o_command: Command,
+    o_path: *Path,
 ) error{WriteFailed}!void {
     const s_fmt = "{:>[1]}";
     const n_max = maxDigit(z_results);
-    const z_paths = o_command.z_paths.items;
+    const s_default = if (z_results.len > 1) "total" else "";
 
-    for (z_results, 0..) |e_result, n_i| {
+    for (z_results) |e_result| {
+        const s_path = o_path.next() orelse s_default;
         if (e_result) |o_count| {
             const t_line = .{ o_count.n_line, n_max };
             const t_word = .{ o_count.n_word, n_max + 1 };
@@ -445,8 +446,7 @@ fn printOut(
                 try writer.print(s_fmt, t_byte);
             }
 
-            const s_file = if (n_i < z_paths.len) z_paths[n_i] else "";
-            try writer.print(" {s}\n", .{s_file});
+            try writer.print(" {s}\n", .{s_path});
         } else |err| {
             try writer.print(S_ERROR_FORMAT, .{err});
         }
@@ -458,10 +458,8 @@ fn printOut(
 test "printOut" {
     const gpa = std.testing.allocator;
 
-    var o_command: Command = try .withCapacity(gpa, 4);
-    defer o_command.z_paths.deinit(gpa);
-
-    try o_command.z_paths.appendSlice(gpa, &[_][]const u8{
+    const o_command: Command = .empty;
+    var path: Path = .init(&.{
         "main.ts",
         "try.ts",
         "notFound.file",
@@ -478,7 +476,7 @@ test "printOut" {
     var stream: Io.Writer.Allocating = try .initCapacity(gpa, 1024);
     defer stream.deinit();
 
-    try printOut(&stream.writer, &a_results, o_command);
+    try printOut(&stream.writer, &a_results, o_command, &path);
 
     const written: []u8 = stream.written();
     const s_want: []const u8 =
